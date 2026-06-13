@@ -479,8 +479,8 @@ from config import Config
 from bot import TelegramBot, PHONE_NUMBER, LOGIN_CODE, LOGIN_PASSWORD, WAITING_GROUPS
 
 # IMPORTANT: You need to get these from https://my.telegram.org
-API_ID = 123456  # Replace with your API ID
-API_HASH = "your_api_hash_here"  # Replace with your API Hash
+API_ID = 29687194  # Replace with your API ID
+API_HASH = "fb286056a72033e9870cacb170b31fcd"  # Replace with your API Hash
 
 async def main():
     # Initialize bot
