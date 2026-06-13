@@ -1,0 +1,8 @@
+# requirements.txt
+"""
+python-telegram-bot==20.6
+telethon==1.34.0
+python-dotenv==1.0.0
+asyncio==3.4.3
+prettytable==3.9.0
+"""
