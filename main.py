@@ -1,40 +1,45 @@
-# requirements.txt
-"""
-telethon==1.34.0
-colorama==0.4.6
-asyncio==3.4.3
-"""
+# telegram_group_joiner.py
+# Complete bot in a single file - Save and run this directly
 
-# config.py
-import json
 import os
-from pathlib import Path
-
-class Config:
-    BOT_TOKEN = "8165906774:AAFYUEtSFr69bUVwW4nhMEq549EIzN4vPmU"  # Get from @BotFather
-    SESSION_DIR = "sessions"
-    DATA_FILE = "accounts_data.json"
-    
-    @staticmethod
-    def ensure_dirs():
-        Path(Config.SESSION_DIR).mkdir(exist_ok=True)
-
-# database.py
 import json
 import asyncio
-from typing import Dict, List, Any
+import re
 from datetime import datetime
-from config import Config
+from pathlib import Path
+from typing import Dict, List, Any
+from telethon import TelegramClient, errors
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ConversationHandler, filters, ContextTypes
 
+# ==================== CONFIGURATION ====================
+# IMPORTANT: Replace these with your actual values
+BOT_TOKEN = "8165906774:AAFYUEtSFr69bUVwW4nhMEq549EIzN4vPmU"  # Get from @BotFather
+API_ID = 29687194  # Get from https://my.telegram.org
+API_HASH = "fb286056a72033e9870cacb170b31fcd"  # Get from https://my.telegram.org
+
+# File paths
+SESSION_DIR = "sessions"
+DATA_FILE = "accounts_data.json"
+
+# Conversation states
+PHONE_NUMBER, LOGIN_CODE, LOGIN_PASSWORD, WAITING_GROUPS = range(4)
+
+# ==================== DATABASE CLASS ====================
 class Database:
     def __init__(self):
         self.accounts: Dict[str, Any] = {}
         self.join_logs: Dict[str, List] = {}
+        self.ensure_dirs()
         self.load_data()
+    
+    def ensure_dirs(self):
+        Path(SESSION_DIR).mkdir(exist_ok=True)
     
     def load_data(self):
         try:
-            with open(Config.DATA_FILE, 'r') as f:
+            with open(DATA_FILE, 'r') as f:
                 data = json.load(f)
                 self.accounts = data.get('accounts', {})
                 self.join_logs = data.get('join_logs', {})
@@ -42,7 +47,7 @@ class Database:
             pass
     
     def save_data(self):
-        with open(Config.DATA_FILE, 'w') as f:
+        with open(DATA_FILE, 'w') as f:
             json.dump({
                 'accounts': self.accounts,
                 'join_logs': self.join_logs
@@ -78,23 +83,19 @@ class Database:
         if phone in self.accounts:
             self.accounts[phone]['is_active'] = False
             self.save_data()
+    
+    def delete_account(self, phone: str):
+        if phone in self.accounts:
+            del self.accounts[phone]
+            if phone in self.join_logs:
+                del self.join_logs[phone]
+            self.save_data()
 
-# account_manager.py
-import asyncio
-from telethon import TelegramClient, errors
-from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
-import re
-from colorama import Fore, Style, init
-from config import Config
-from database import Database
-
-init(autoreset=True)
-
+# ==================== ACCOUNT MANAGER ====================
 class AccountManager:
     def __init__(self, db: Database):
         self.db = db
         self.clients: Dict[str, TelegramClient] = {}
-        self.login_tasks = {}
     
     def extract_invite_hash(self, link: str) -> str:
         """Extract invite hash from various Telegram invite link formats"""
@@ -113,8 +114,8 @@ class AccountManager:
     
     async def login_account(self, phone: str, code_callback, password_callback=None):
         """Login to a Telegram account"""
-        session_file = f"{Config.SESSION_DIR}/{phone}"
-        client = TelegramClient(session_file, api_id, api_hash)
+        session_file = f"{SESSION_DIR}/{phone.replace('+', '')}"
+        client = TelegramClient(session_file, API_ID, API_HASH)
         
         try:
             await client.connect()
@@ -136,7 +137,7 @@ class AccountManager:
             self.clients[phone] = client
             self.db.add_account(phone, str(me.id), me.first_name)
             
-            return {"success": True, "user": me.first_name}
+            return {"success": True, "user": me.first_name, "phone": phone}
         except Exception as e:
             return {"success": False, "error": str(e)}
     
@@ -146,15 +147,6 @@ class AccountManager:
             invite_hash = self.extract_invite_hash(link)
             if not invite_hash:
                 return {"status": "invalid_link", "message": "Invalid invite link format"}
-            
-            # Check if already joined
-            try:
-                result = await client(CheckChatInviteRequest(hash=invite_hash))
-                if hasattr(result, 'chat') and result.chat:
-                    if hasattr(result.chat, 'participants_count'):
-                        return {"status": "already_member", "message": f"Already a member of {result.chat.title}"}
-            except Exception:
-                pass
             
             # Join the group
             result = await client(ImportChatInviteRequest(invite_hash))
@@ -183,7 +175,15 @@ class AccountManager:
     async def join_groups_for_account(self, phone: str, group_links: list, progress_callback=None):
         """Join multiple groups for a specific account"""
         if phone not in self.clients:
-            return {"success": False, "error": "Account not logged in"}
+            # Try to reconnect
+            session_file = f"{SESSION_DIR}/{phone.replace('+', '')}"
+            client = TelegramClient(session_file, API_ID, API_HASH)
+            await client.connect()
+            
+            if await client.is_user_authorized():
+                self.clients[phone] = client
+            else:
+                return {"success": False, "error": "Account not logged in"}
         
         client = self.clients[phone]
         results = []
@@ -209,27 +209,14 @@ class AccountManager:
         if phone in self.clients:
             await self.clients[phone].disconnect()
             del self.clients[phone]
-        self.db.remove_account(phone)
+        self.db.delete_account(phone)
 
-# bot.py
-import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, filters, ContextTypes
-from config import Config
-from database import Database
-from account_manager import AccountManager
-import os
-
-# Conversation states
-PHONE_NUMBER, LOGIN_CODE, LOGIN_PASSWORD, WAITING_GROUPS = range(4)
-
+# ==================== BOT HANDLER ====================
 class TelegramBot:
     def __init__(self):
-        Config.ensure_dirs()
         self.db = Database()
         self.account_manager = AccountManager(self.db)
         self.pending_logins = {}
-        self.pending_groups = {}
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
@@ -263,8 +250,8 @@ class TelegramBot:
                 "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
-            return ConversationHandler.END
-            # return PHONE_NUMBER
+            context.user_data['login_phone'] = True
+            return PHONE_NUMBER
         
         elif query.data == 'list_accounts':
             accounts = self.db.get_accounts()
@@ -412,6 +399,92 @@ class TelegramBot:
         
         return ConversationHandler.END
     
+    async def phone_number_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle phone number input"""
+        phone = update.message.text.strip()
+        context.user_data['login_phone'] = phone
+        
+        await update.message.reply_text(
+            "📱 *Verification Code*\n\n"
+            "Please enter the verification code you received on Telegram:",
+            parse_mode='Markdown'
+        )
+        return LOGIN_CODE
+    
+    async def code_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle verification code input"""
+        code = update.message.text.strip()
+        phone = context.user_data.get('login_phone')
+        
+        # Create callbacks for the login process
+        async def get_code():
+            return code
+        
+        async def get_password():
+            # This will be handled in the next state
+            context.user_data['needs_password'] = True
+            return None
+        
+        result = await self.account_manager.login_account(phone, get_code, get_password)
+        
+        if result['success']:
+            await update.message.reply_text(
+                f"✅ *Login Successful!*\n\n"
+                f"Welcome {result['user']}!\n"
+                f"Phone: {result['phone']}\n\n"
+                f"Use /start to continue.",
+                parse_mode='Markdown'
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+        elif "password" in result['error'].lower():
+            await update.message.reply_text(
+                "🔐 *2FA Password Required*\n\n"
+                "This account has two-factor authentication enabled.\n"
+                "Please enter your password:",
+                parse_mode='Markdown'
+            )
+            return LOGIN_PASSWORD
+        else:
+            await update.message.reply_text(
+                f"❌ *Login Failed*\n\nError: {result['error']}\n\n"
+                f"Please try again with /start",
+                parse_mode='Markdown'
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+    
+    async def password_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle 2FA password input"""
+        password = update.message.text.strip()
+        phone = context.user_data.get('login_phone')
+        
+        async def get_code():
+            return None
+        
+        async def get_password():
+            return password
+        
+        result = await self.account_manager.login_account(phone, get_code, get_password)
+        
+        if result['success']:
+            await update.message.reply_text(
+                f"✅ *Login Successful!*\n\n"
+                f"Welcome {result['user']}!\n"
+                f"Phone: {result['phone']}\n\n"
+                f"Use /start to continue.",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ *Login Failed*\n\nError: {result['error']}\n\n"
+                f"Please try again with /start",
+                parse_mode='Markdown'
+            )
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+    
     async def handle_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle group links input"""
         if not context.user_data.get('waiting_for_groups'):
@@ -459,8 +532,14 @@ class TelegramBot:
                         'error': '⚠️'
                     }.get(r['status'], '❓')
                     report += f"{status_icon} {r['link']}\n   {r['message']}\n\n"
+                    
+                    # Split if too long
+                    if len(report) > 4000:
+                        await update.message.reply_text(report, parse_mode='Markdown')
+                        report = ""
                 
-                await update.message.reply_text(report, parse_mode='Markdown')
+                if report:
+                    await update.message.reply_text(report, parse_mode='Markdown')
         
         context.user_data['waiting_for_groups'] = False
         context.user_data['selected_accounts'] = []
@@ -472,65 +551,66 @@ class TelegramBot:
         await update.message.reply_text("Operation cancelled. Use /start to begin again.")
         return ConversationHandler.END
 
-# main.py
-import asyncio
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ConversationHandler, filters
-from config import Config
-from bot import TelegramBot, PHONE_NUMBER, LOGIN_CODE, LOGIN_PASSWORD, WAITING_GROUPS
-
-# IMPORTANT: You need to get these from https://my.telegram.org
-API_ID = 29687194  # Replace with your API ID
-API_HASH = "fb286056a72033e9870cacb170b31fcd"  # Replace with your API Hash
-
+# ==================== MAIN ====================
 async def main():
+    # Validate configuration
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("\n❌ ERROR: Please set your BOT_TOKEN in the script!")
+        print("Get it from @BotFather on Telegram\n")
+        return
+    
+    if API_ID == 123456 or API_HASH == "your_api_hash_here":
+        print("\n❌ ERROR: Please set your API_ID and API_HASH in the script!")
+        print("Get them from https://my.telegram.org\n")
+        return
+    
     # Initialize bot
     telegram_bot = TelegramBot()
     
     # Create application
-    application = Application.builder().token(Config.BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", telegram_bot.start))
-    application.add_handler(CallbackQueryHandler(telegram_bot.button_handler))
+    # Add conversation handler for login
+    login_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(telegram_bot.button_handler, pattern='add_account')],
+        states={
+            PHONE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.phone_number_handler)],
+            LOGIN_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.code_handler)],
+            LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.password_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", telegram_bot.cancel)]
+    )
     
-    # Group links conversation
-    conv_handler = ConversationHandler(
+    # Add conversation handler for groups
+    groups_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(telegram_bot.button_handler, pattern='continue_to_groups')],
         states={
             WAITING_GROUPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.handle_groups)],
         },
         fallbacks=[CommandHandler("cancel", telegram_bot.cancel)]
     )
-    application.add_handler(conv_handler)
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", telegram_bot.start))
+    application.add_handler(CallbackQueryHandler(telegram_bot.button_handler))
+    application.add_handler(login_conv_handler)
+    application.add_handler(groups_conv_handler)
     
     # Start bot
-    print("Bot is starting...")
+    print("\n✅ Bot is starting...")
+    print(f"Bot Token: {BOT_TOKEN[:10]}...")
+    print("Press Ctrl+C to stop\n")
+    
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    
-    print("Bot is running! Press Ctrl+C to stop.")
     
     # Keep running
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\n👋 Shutting down...")
         await application.stop()
 
 if __name__ == "__main__":
-    # Set your credentials here or use environment variables
-    API_ID = os.getenv('TELEGRAM_API_ID', API_ID)
-    API_HASH = os.getenv('TELEGRAM_API_HASH', API_HASH)
-    
-    if API_ID == 123456 or API_HASH == "your_api_hash_here":
-        print("⚠️ WARNING: Please set your API_ID and API_HASH in main.py")
-        print("Get them from https://my.telegram.org")
-        exit(1)
-    
-    # Import API credentials to account_manager
-    import account_manager
-    account_manager.api_id = API_ID
-    account_manager.api_hash = API_HASH
-    
     asyncio.run(main())
