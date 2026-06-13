@@ -1,10 +1,11 @@
-# telegram_group_joiner_fixed.py
-# Complete fixed version with working login
+# telegram_group_joiner_debug.py
+# Complete bot with extensive logging
 
 import os
 import json
 import asyncio
 import re
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any
@@ -12,6 +13,13 @@ from telethon import TelegramClient, errors
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ConversationHandler, filters, ContextTypes
+
+# Enable detailed logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURATION ====================
 # IMPORTANT: Replace these with your actual values
@@ -33,6 +41,7 @@ class Database:
         self.join_logs: Dict[str, List] = {}
         self.ensure_dirs()
         self.load_data()
+        logger.info("Database initialized")
     
     def ensure_dirs(self):
         Path(SESSION_DIR).mkdir(exist_ok=True)
@@ -43,7 +52,9 @@ class Database:
                 data = json.load(f)
                 self.accounts = data.get('accounts', {})
                 self.join_logs = data.get('join_logs', {})
+                logger.info(f"Loaded {len(self.accounts)} accounts from database")
         except FileNotFoundError:
+            logger.info("No existing database found, creating new one")
             pass
     
     def save_data(self):
@@ -63,6 +74,7 @@ class Database:
             }
             self.join_logs[phone] = []
             self.save_data()
+            logger.info(f"Added account: {phone} - {first_name}")
     
     def log_join_result(self, phone: str, group_link: str, status: str, message: str):
         if phone not in self.join_logs:
@@ -83,6 +95,7 @@ class Database:
         if phone in self.accounts:
             self.accounts[phone]['is_active'] = False
             self.save_data()
+            logger.info(f"Removed account: {phone}")
     
     def delete_account(self, phone: str):
         if phone in self.accounts:
@@ -90,13 +103,14 @@ class Database:
             if phone in self.join_logs:
                 del self.join_logs[phone]
             self.save_data()
+            logger.info(f"Deleted account: {phone}")
 
 # ==================== ACCOUNT MANAGER ====================
 class AccountManager:
     def __init__(self, db: Database):
         self.db = db
         self.clients: Dict[str, TelegramClient] = {}
-        self.login_queues: Dict[str, asyncio.Queue] = {}
+        logger.info("AccountManager initialized")
     
     def extract_invite_hash(self, link: str) -> str:
         """Extract invite hash from various Telegram invite link formats"""
@@ -115,63 +129,133 @@ class AccountManager:
     
     async def login_account(self, phone: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Login to a Telegram account with proper async handling"""
+        logger.info(f"Starting login process for phone: {phone}")
+        
         session_file = f"{SESSION_DIR}/{phone.replace('+', '')}"
+        logger.info(f"Session file path: {session_file}")
+        
         client = TelegramClient(session_file, API_ID, API_HASH)
         
         try:
             # Send initial message
-            await update.message.reply_text(f"📱 Connecting to {phone}...")
+            await update.message.reply_text(f"📱 Connecting to {phone}...\n\n⚙️ This may take a few seconds...")
+            logger.info(f"Connecting client for {phone}")
             
             await client.connect()
+            logger.info(f"Client connected for {phone}")
             
             if not await client.is_user_authorized():
-                # Send code request
-                await client.send_code_request(phone)
-                await update.message.reply_text(
-                    f"✅ Verification code sent to {phone}\n"
-                    f"Please enter the code you received:"
-                )
+                logger.info(f"User not authorized, sending code request to {phone}")
                 
-                # Wait for code from user
-                context.user_data['temp_client'] = client
-                context.user_data['temp_phone'] = phone
-                return LOGIN_CODE
+                # Send code request
+                try:
+                    await client.send_code_request(phone)
+                    logger.info(f"Code request sent successfully to {phone}")
+                    
+                    await update.message.reply_text(
+                        f"✅ Verification code sent to {phone}\n\n"
+                        f"📝 Please check your Telegram app and enter the code you received:\n"
+                        f"(The code usually starts with a number and might be in your Telegram chats)"
+                    )
+                    
+                    # Store client in context
+                    context.user_data['temp_client'] = client
+                    context.user_data['temp_phone'] = phone
+                    logger.info(f"Waiting for code input for {phone}")
+                    return LOGIN_CODE
+                    
+                except errors.PhoneNumberInvalidError:
+                    logger.error(f"Invalid phone number: {phone}")
+                    await update.message.reply_text(
+                        "❌ *Invalid Phone Number*\n\n"
+                        "The phone number format is incorrect or not registered on Telegram.\n"
+                        "Please use international format: `+1234567890`\n\n"
+                        "Send /cancel to cancel.",
+                        parse_mode='Markdown'
+                    )
+                    return ConversationHandler.END
+                    
+                except errors.FloodWaitError as e:
+                    logger.error(f"Flood wait error: {e.seconds} seconds")
+                    await update.message.reply_text(
+                        f"⚠️ *Too Many Attempts*\n\n"
+                        f"Please wait {e.seconds} seconds before trying again.\n"
+                        f"Send /cancel to cancel.",
+                        parse_mode='Markdown'
+                    )
+                    return ConversationHandler.END
+                    
             else:
                 # Already logged in
+                logger.info(f"User already authorized for {phone}")
                 me = await client.get_me()
                 self.clients[phone] = client
                 self.db.add_account(phone, str(me.id), me.first_name)
                 await update.message.reply_text(
                     f"✅ *Already logged in!*\n\n"
                     f"Welcome back {me.first_name}!\n"
-                    f"Phone: {phone}",
+                    f"Phone: {phone}\n\n"
+                    f"Use /start to continue.",
                     parse_mode='Markdown'
                 )
+                logger.info(f"Login completed (existing session) for {phone}")
                 return ConversationHandler.END
                 
+        except errors.ApiIdInvalidError:
+            logger.error("API ID or API Hash is invalid")
+            await update.message.reply_text(
+                "❌ *Configuration Error*\n\n"
+                "Invalid API ID or API Hash.\n"
+                "Please check your credentials in the script.",
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
+            logger.error(f"Unexpected error during login: {str(e)}", exc_info=True)
+            await update.message.reply_text(
+                f"❌ *Connection Error*\n\n"
+                f"Error: {str(e)}\n\n"
+                f"Please check:\n"
+                f"1. Your internet connection\n"
+                f"2. API ID and Hash are correct\n"
+                f"3. Phone number format is correct\n\n"
+                f"Send /cancel to cancel.",
+                parse_mode='Markdown'
+            )
             return ConversationHandler.END
     
     async def verify_code(self, code: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Verify the login code"""
+        logger.info(f"Verifying code for phone: {context.user_data.get('temp_phone')}")
+        
         client = context.user_data.get('temp_client')
         phone = context.user_data.get('temp_phone')
         
         if not client:
-            await update.message.reply_text("❌ Session expired. Please start over with /start")
+            logger.error("Session expired - no client found")
+            await update.message.reply_text(
+                "❌ Session expired. Please start over with /start"
+            )
             return ConversationHandler.END
         
         try:
+            logger.info(f"Attempting to sign in with code for {phone}")
             await client.sign_in(phone, code)
+            logger.info(f"Sign in successful for {phone}")
+            
             me = await client.get_me()
+            logger.info(f"Got user info: {me.first_name} (ID: {me.id})")
+            
             self.clients[phone] = client
             self.db.add_account(phone, str(me.id), me.first_name)
             
             await update.message.reply_text(
                 f"✅ *Login Successful!*\n\n"
                 f"Welcome {me.first_name}!\n"
-                f"Phone: {phone}\n\n"
+                f"Phone: {phone}\n"
+                f"User ID: {me.id}\n\n"
+                f"🎉 Account added successfully!\n"
                 f"Use /start to continue.",
                 parse_mode='Markdown'
             )
@@ -179,9 +263,11 @@ class AccountManager:
             # Cleanup
             del context.user_data['temp_client']
             del context.user_data['temp_phone']
+            logger.info(f"Login completed for {phone}")
             return ConversationHandler.END
             
         except errors.SessionPasswordNeededError:
+            logger.info(f"2FA password required for {phone}")
             await update.message.reply_text(
                 "🔐 *2FA Password Required*\n\n"
                 "This account has two-factor authentication enabled.\n"
@@ -190,21 +276,56 @@ class AccountManager:
             )
             context.user_data['needs_password'] = True
             return LOGIN_PASSWORD
+            
+        except errors.PhoneCodeInvalidError:
+            logger.warning(f"Invalid code entered for {phone}")
+            await update.message.reply_text(
+                "❌ *Invalid Code*\n\n"
+                "The verification code you entered is incorrect.\n"
+                "Please try again with /start",
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+            
+        except errors.PhoneCodeExpiredError:
+            logger.warning(f"Code expired for {phone}")
+            await update.message.reply_text(
+                "❌ *Code Expired*\n\n"
+                "The verification code has expired.\n"
+                "Please start over with /start",
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ Invalid code or error: {str(e)}\nPlease try again with /start")
+            logger.error(f"Error verifying code: {str(e)}", exc_info=True)
+            await update.message.reply_text(
+                f"❌ *Verification Error*\n\n"
+                f"Error: {str(e)}\n\n"
+                f"Please try again with /start",
+                parse_mode='Markdown'
+            )
             return ConversationHandler.END
     
     async def verify_password(self, password: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Verify 2FA password"""
+        logger.info(f"Verifying 2FA password for phone: {context.user_data.get('temp_phone')}")
+        
         client = context.user_data.get('temp_client')
         phone = context.user_data.get('temp_phone')
         
         if not client:
-            await update.message.reply_text("❌ Session expired. Please start over with /start")
+            logger.error("Session expired - no client found for 2FA")
+            await update.message.reply_text(
+                "❌ Session expired. Please start over with /start"
+            )
             return ConversationHandler.END
         
         try:
+            logger.info(f"Attempting to sign in with password for {phone}")
             await client.sign_in(password=password)
+            logger.info(f"Password sign in successful for {phone}")
+            
             me = await client.get_me()
             self.clients[phone] = client
             self.db.add_account(phone, str(me.id), me.first_name)
@@ -221,10 +342,27 @@ class AccountManager:
             del context.user_data['temp_client']
             del context.user_data['temp_phone']
             del context.user_data['needs_password']
+            logger.info(f"2FA login completed for {phone}")
+            return ConversationHandler.END
+            
+        except errors.PasswordHashInvalidError:
+            logger.warning(f"Invalid password for {phone}")
+            await update.message.reply_text(
+                "❌ *Invalid Password*\n\n"
+                "The 2FA password you entered is incorrect.\n"
+                "Please try again with /start",
+                parse_mode='Markdown'
+            )
             return ConversationHandler.END
             
         except Exception as e:
-            await update.message.reply_text(f"❌ Invalid password: {str(e)}\nPlease try again with /start")
+            logger.error(f"Error verifying password: {str(e)}", exc_info=True)
+            await update.message.reply_text(
+                f"❌ *Password Error*\n\n"
+                f"Error: {str(e)}\n\n"
+                f"Please try again with /start",
+                parse_mode='Markdown'
+            )
             return ConversationHandler.END
     
     async def join_group(self, client: TelegramClient, link: str, phone: str) -> dict:
@@ -260,6 +398,8 @@ class AccountManager:
     
     async def join_groups_for_account(self, phone: str, group_links: list, progress_callback=None):
         """Join multiple groups for a specific account"""
+        logger.info(f"Joining {len(group_links)} groups for account {phone}")
+        
         if phone not in self.clients:
             # Try to reconnect
             session_file = f"{SESSION_DIR}/{phone.replace('+', '')}"
@@ -268,7 +408,9 @@ class AccountManager:
             
             if await client.is_user_authorized():
                 self.clients[phone] = client
+                logger.info(f"Reconnected to account {phone}")
             else:
+                logger.error(f"Account {phone} not logged in")
                 return {"success": False, "error": "Account not logged in"}
         
         client = self.clients[phone]
@@ -278,6 +420,7 @@ class AccountManager:
             if progress_callback:
                 await progress_callback(idx + 1, len(group_links), link)
             
+            logger.info(f"Joining {link} for account {phone}")
             result = await self.join_group(client, link, phone)
             self.db.log_join_result(phone, link, result['status'], result['message'])
             results.append({
@@ -288,10 +431,12 @@ class AccountManager:
             # Add small delay between joins to avoid rate limiting
             await asyncio.sleep(2)
         
+        logger.info(f"Completed joining for account {phone}")
         return {"success": True, "results": results}
     
     async def logout_account(self, phone: str):
         """Logout and remove account"""
+        logger.info(f"Logging out account {phone}")
         if phone in self.clients:
             await self.clients[phone].disconnect()
             del self.clients[phone]
@@ -302,9 +447,12 @@ class TelegramBot:
     def __init__(self):
         self.db = Database()
         self.account_manager = AccountManager(self.db)
+        logger.info("TelegramBot initialized")
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
+        logger.info(f"Start command from user {update.effective_user.id}")
+        
         keyboard = [
             [InlineKeyboardButton("➕ Add Account", callback_data='add_account')],
             [InlineKeyboardButton("📋 List Accounts", callback_data='list_accounts')],
@@ -327,11 +475,17 @@ class TelegramBot:
         query = update.callback_query
         await query.answer()
         
+        logger.info(f"Button clicked: {query.data} by user {update.effective_user.id}")
+        
         if query.data == 'add_account':
             await query.edit_message_text(
                 "📱 *Add New Account*\n\n"
                 "Please send your phone number in international format.\n"
                 "Example: `+1234567890`\n\n"
+                "⚠️ Make sure:\n"
+                "• Include country code\n"
+                "• Start with +\n"
+                "• No spaces or special characters\n\n"
                 "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
@@ -511,17 +665,27 @@ class TelegramBot:
     async def phone_number_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle phone number input"""
         phone = update.message.text.strip()
+        logger.info(f"Received phone number: {phone} from user {update.effective_user.id}")
         
         # Basic phone number validation
-        if not phone.startswith('+') or not phone[1:].isdigit():
+        if not phone.startswith('+') or not phone[1:].replace(' ', '').isdigit():
+            logger.warning(f"Invalid phone number format: {phone}")
             await update.message.reply_text(
                 "❌ *Invalid phone number format*\n\n"
                 "Please use international format with country code.\n"
                 "Example: `+1234567890`\n\n"
+                "Make sure:\n"
+                "• Starts with +\n"
+                "• Contains only numbers after +\n"
+                "• No spaces or dashes\n\n"
                 "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
             return PHONE_NUMBER
+        
+        # Remove spaces if any
+        phone = phone.replace(' ', '')
+        logger.info(f"Validated phone number: {phone}")
         
         # Start login process
         result = await self.account_manager.login_account(phone, update, context)
@@ -530,25 +694,31 @@ class TelegramBot:
     async def code_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle verification code input"""
         code = update.message.text.strip()
+        logger.info(f"Received code from user {update.effective_user.id}")
         
         # Validate code
         if not code.isdigit():
+            logger.warning(f"Invalid code format: {code}")
             await update.message.reply_text(
                 "❌ *Invalid code*\n\n"
                 "Please enter the numeric code you received.\n"
+                "The code should contain only numbers.\n\n"
                 "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
             return LOGIN_CODE
         
+        logger.info(f"Valid code format, verifying...")
         result = await self.account_manager.verify_code(code, update, context)
         return result
     
     async def password_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle 2FA password input"""
         password = update.message.text.strip()
+        logger.info(f"Received 2FA password from user {update.effective_user.id}")
         
         if not password:
+            logger.warning("Empty password received")
             await update.message.reply_text(
                 "❌ *Invalid password*\n\n"
                 "Please enter your 2FA password.\n"
@@ -567,6 +737,7 @@ class TelegramBot:
         
         group_links = update.message.text.strip().split('\n')
         group_links = [link.strip() for link in group_links if link.strip()]
+        logger.info(f"Received {len(group_links)} group links from user {update.effective_user.id}")
         
         # Validate links
         valid_links = []
@@ -574,6 +745,7 @@ class TelegramBot:
             if self.account_manager.extract_invite_hash(link):
                 valid_links.append(link)
             else:
+                logger.warning(f"Invalid link format: {link}")
                 await update.message.reply_text(f"⚠️ Invalid link format (skipped): {link}")
         
         if not valid_links:
@@ -581,6 +753,7 @@ class TelegramBot:
             return WAITING_GROUPS
         
         selected_accounts = context.user_data.get('selected_accounts', [])
+        logger.info(f"Processing {len(valid_links)} groups for {len(selected_accounts)} accounts")
         
         progress_msg = await update.message.reply_text(
             f"🚀 *Starting join process...*\n\n"
@@ -648,6 +821,7 @@ class TelegramBot:
     
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel conversation"""
+        logger.info(f"Cancel command from user {update.effective_user.id}")
         context.user_data.clear()
         await update.message.reply_text(
             "❌ Operation cancelled.\n\n"
@@ -659,17 +833,17 @@ class TelegramBot:
 async def main():
     # Validate configuration
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("\n" + "="*50)
+        print("\n" + "="*60)
         print("❌ ERROR: Please set your BOT_TOKEN!")
         print("Get it from @BotFather on Telegram")
-        print("="*50 + "\n")
+        print("="*60 + "\n")
         return
     
     if API_ID == 123456 or API_HASH == "your_api_hash_here":
-        print("\n" + "="*50)
+        print("\n" + "="*60)
         print("❌ ERROR: Please set your API_ID and API_HASH!")
         print("Get them from https://my.telegram.org")
-        print("="*50 + "\n")
+        print("="*60 + "\n")
         return
     
     # Initialize bot
@@ -706,25 +880,28 @@ async def main():
     application.add_handler(groups_conv_handler)
     
     # Start bot
-    print("\n" + "="*50)
+    print("\n" + "="*60)
     print("✅ Bot is starting...")
     print(f"📡 Bot Token: {BOT_TOKEN[:15]}...")
     print("💡 Press Ctrl+C to stop")
-    print("="*50 + "\n")
+    print("="*60 + "\n")
     
     # Start the bot
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
     
+    print("✅ Bot is running! Check the logs above for any errors.")
+    print("📱 Open Telegram and start your bot with /start\n")
+    
     # Keep running
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:
-        print("\n" + "="*50)
+        print("\n" + "="*60)
         print("👋 Shutting down gracefully...")
-        print("="*50 + "\n")
+        print("="*60 + "\n")
         await application.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio
