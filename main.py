@@ -1,5 +1,5 @@
-# telegram_group_joiner.py
-# Complete bot in a single file - Save and run this directly
+# telegram_group_joiner_fixed.py
+# Complete fixed version with working login
 
 import os
 import json
@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any
 from telethon import TelegramClient, errors
-from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ConversationHandler, filters, ContextTypes
 
@@ -96,6 +96,7 @@ class AccountManager:
     def __init__(self, db: Database):
         self.db = db
         self.clients: Dict[str, TelegramClient] = {}
+        self.login_queues: Dict[str, asyncio.Queue] = {}
     
     def extract_invite_hash(self, link: str) -> str:
         """Extract invite hash from various Telegram invite link formats"""
@@ -112,34 +113,119 @@ class AccountManager:
                 return match.group(1)
         return None
     
-    async def login_account(self, phone: str, code_callback, password_callback=None):
-        """Login to a Telegram account"""
+    async def login_account(self, phone: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Login to a Telegram account with proper async handling"""
         session_file = f"{SESSION_DIR}/{phone.replace('+', '')}"
         client = TelegramClient(session_file, API_ID, API_HASH)
         
         try:
+            # Send initial message
+            await update.message.reply_text(f"📱 Connecting to {phone}...")
+            
             await client.connect()
             
             if not await client.is_user_authorized():
+                # Send code request
                 await client.send_code_request(phone)
-                code = await code_callback()
+                await update.message.reply_text(
+                    f"✅ Verification code sent to {phone}\n"
+                    f"Please enter the code you received:"
+                )
                 
-                try:
-                    await client.sign_in(phone, code)
-                except errors.SessionPasswordNeededError:
-                    if password_callback:
-                        password = await password_callback()
-                        await client.sign_in(password=password)
-                    else:
-                        raise Exception("2FA password required")
-            
+                # Wait for code from user
+                context.user_data['temp_client'] = client
+                context.user_data['temp_phone'] = phone
+                return LOGIN_CODE
+            else:
+                # Already logged in
+                me = await client.get_me()
+                self.clients[phone] = client
+                self.db.add_account(phone, str(me.id), me.first_name)
+                await update.message.reply_text(
+                    f"✅ *Already logged in!*\n\n"
+                    f"Welcome back {me.first_name}!\n"
+                    f"Phone: {phone}",
+                    parse_mode='Markdown'
+                )
+                return ConversationHandler.END
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            return ConversationHandler.END
+    
+    async def verify_code(self, code: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Verify the login code"""
+        client = context.user_data.get('temp_client')
+        phone = context.user_data.get('temp_phone')
+        
+        if not client:
+            await update.message.reply_text("❌ Session expired. Please start over with /start")
+            return ConversationHandler.END
+        
+        try:
+            await client.sign_in(phone, code)
             me = await client.get_me()
             self.clients[phone] = client
             self.db.add_account(phone, str(me.id), me.first_name)
             
-            return {"success": True, "user": me.first_name, "phone": phone}
+            await update.message.reply_text(
+                f"✅ *Login Successful!*\n\n"
+                f"Welcome {me.first_name}!\n"
+                f"Phone: {phone}\n\n"
+                f"Use /start to continue.",
+                parse_mode='Markdown'
+            )
+            
+            # Cleanup
+            del context.user_data['temp_client']
+            del context.user_data['temp_phone']
+            return ConversationHandler.END
+            
+        except errors.SessionPasswordNeededError:
+            await update.message.reply_text(
+                "🔐 *2FA Password Required*\n\n"
+                "This account has two-factor authentication enabled.\n"
+                "Please enter your password:",
+                parse_mode='Markdown'
+            )
+            context.user_data['needs_password'] = True
+            return LOGIN_PASSWORD
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            await update.message.reply_text(f"❌ Invalid code or error: {str(e)}\nPlease try again with /start")
+            return ConversationHandler.END
+    
+    async def verify_password(self, password: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Verify 2FA password"""
+        client = context.user_data.get('temp_client')
+        phone = context.user_data.get('temp_phone')
+        
+        if not client:
+            await update.message.reply_text("❌ Session expired. Please start over with /start")
+            return ConversationHandler.END
+        
+        try:
+            await client.sign_in(password=password)
+            me = await client.get_me()
+            self.clients[phone] = client
+            self.db.add_account(phone, str(me.id), me.first_name)
+            
+            await update.message.reply_text(
+                f"✅ *Login Successful!*\n\n"
+                f"Welcome {me.first_name}!\n"
+                f"Phone: {phone}\n\n"
+                f"Use /start to continue.",
+                parse_mode='Markdown'
+            )
+            
+            # Cleanup
+            del context.user_data['temp_client']
+            del context.user_data['temp_phone']
+            del context.user_data['needs_password']
+            return ConversationHandler.END
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ Invalid password: {str(e)}\nPlease try again with /start")
+            return ConversationHandler.END
     
     async def join_group(self, client: TelegramClient, link: str, phone: str) -> dict:
         """Join a Telegram group using invite link"""
@@ -216,7 +302,6 @@ class TelegramBot:
     def __init__(self):
         self.db = Database()
         self.account_manager = AccountManager(self.db)
-        self.pending_logins = {}
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
@@ -245,29 +330,29 @@ class TelegramBot:
         if query.data == 'add_account':
             await query.edit_message_text(
                 "📱 *Add New Account*\n\n"
-                "Please enter your phone number in international format.\n"
-                "Example: +1234567890\n\n"
+                "Please send your phone number in international format.\n"
+                "Example: `+1234567890`\n\n"
                 "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
-            context.user_data['login_phone'] = True
             return PHONE_NUMBER
         
         elif query.data == 'list_accounts':
             accounts = self.db.get_accounts()
             if not accounts:
-                await query.edit_message_text("No accounts added yet. Use 'Add Account' to add one.")
+                await query.edit_message_text("❌ No accounts added yet. Use 'Add Account' to add one.")
             else:
                 msg = "*📱 Your Accounts:*\n\n"
                 for phone, info in accounts.items():
                     msg += f"• `{phone}` - {info['first_name']}\n"
                 await query.edit_message_text(msg, parse_mode='Markdown')
+            return ConversationHandler.END
         
         elif query.data == 'join_groups':
             accounts = self.db.get_accounts()
             if not accounts:
-                await query.edit_message_text("No accounts available. Please add an account first.")
-                return
+                await query.edit_message_text("❌ No accounts available. Please add an account first.")
+                return ConversationHandler.END
             
             keyboard = []
             for phone, info in accounts.items():
@@ -278,10 +363,13 @@ class TelegramBot:
             keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back')])
             
             await query.edit_message_text(
+                "📋 *Select Accounts*\n\n"
                 "Select account(s) to join groups:\n"
                 "(You'll be asked to provide group links after selection)",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
+            return ConversationHandler.END
         
         elif query.data.startswith('select_account_'):
             phone = query.data.replace('select_account_', '')
@@ -291,10 +379,8 @@ class TelegramBot:
             
             if phone in context.user_data['selected_accounts']:
                 context.user_data['selected_accounts'].remove(phone)
-                action = "deselected"
             else:
                 context.user_data['selected_accounts'].append(phone)
-                action = "selected"
             
             accounts = self.db.get_accounts()
             keyboard = []
@@ -309,27 +395,29 @@ class TelegramBot:
                 keyboard.append([InlineKeyboardButton("🚀 Continue to Groups", callback_data='continue_to_groups')])
             keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back')])
             
+            selected_text = "\n".join([f"• {p}" for p in context.user_data['selected_accounts']]) if context.user_data['selected_accounts'] else "None"
+            
             await query.edit_message_text(
-                f"Selected {len(context.user_data['selected_accounts'])} account(s).\n"
-                f"Tap again to deselect.\n\n"
-                f"**Current selection:**\n" + 
-                "\n".join([f"• {p}" for p in context.user_data['selected_accounts']]),
+                f"*Selected Accounts:* {len(context.user_data['selected_accounts'])}\n\n"
+                f"{selected_text}\n\n"
+                f"Tap again to deselect.",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
+            return ConversationHandler.END
         
         elif query.data == 'continue_to_groups':
             if not context.user_data.get('selected_accounts'):
-                await query.edit_message_text("Please select at least one account first.")
-                return
+                await query.edit_message_text("❌ Please select at least one account first.")
+                return ConversationHandler.END
             
             await query.edit_message_text(
                 "📝 *Send Group Links*\n\n"
                 "Please send the group links you want to join.\n"
                 "You can send multiple links separated by newlines.\n\n"
                 "Example:\n"
-                "https://t.me/joinchat/abc123\n"
-                "https://t.me/joinchat/def456\n\n"
+                "`https://t.me/joinchat/abc123`\n"
+                "`https://t.me/joinchat/def456`\n\n"
                 "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
@@ -339,25 +427,27 @@ class TelegramBot:
         elif query.data == 'view_logs':
             accounts = self.db.get_accounts()
             if not accounts:
-                await query.edit_message_text("No accounts found.")
-                return
+                await query.edit_message_text("❌ No accounts found.")
+                return ConversationHandler.END
             
             keyboard = [[InlineKeyboardButton(info['first_name'], callback_data=f"logs_{phone}")] 
                        for phone, info in accounts.items()]
             keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back')])
             
             await query.edit_message_text(
-                "Select account to view join logs:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                "📊 *Select Account* to view join logs:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
+            return ConversationHandler.END
         
         elif query.data.startswith('logs_'):
             phone = query.data.replace('logs_', '')
             logs = self.db.join_logs.get(phone, [])
             
             if not logs:
-                await query.edit_message_text(f"No join logs for {phone}")
-                return
+                await query.edit_message_text(f"📊 No join logs for {phone}")
+                return ConversationHandler.END
             
             msg = f"📊 *Join Logs for {phone}*\n\n"
             for log in logs[-10:]:  # Last 10 entries
@@ -373,117 +463,102 @@ class TelegramBot:
                 msg += f"   {log['message']}\n\n"
             
             await query.edit_message_text(msg, parse_mode='Markdown')
+            return ConversationHandler.END
         
         elif query.data == 'remove_account':
             accounts = self.db.get_accounts()
             if not accounts:
-                await query.edit_message_text("No accounts to remove.")
-                return
+                await query.edit_message_text("❌ No accounts to remove.")
+                return ConversationHandler.END
             
             keyboard = [[InlineKeyboardButton(info['first_name'], callback_data=f"remove_{phone}")] 
                        for phone, info in accounts.items()]
             keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back')])
             
             await query.edit_message_text(
-                "Select account to remove:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                "🗑️ *Select Account* to remove:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
+            return ConversationHandler.END
         
         elif query.data.startswith('remove_'):
             phone = query.data.replace('remove_', '')
             await self.account_manager.logout_account(phone)
             await query.edit_message_text(f"✅ Account {phone} has been removed.")
+            return ConversationHandler.END
         
         elif query.data == 'back':
-            await self.start(update, context)
+            # Go back to main menu
+            keyboard = [
+                [InlineKeyboardButton("➕ Add Account", callback_data='add_account')],
+                [InlineKeyboardButton("📋 List Accounts", callback_data='list_accounts')],
+                [InlineKeyboardButton("🔗 Join Groups", callback_data='join_groups')],
+                [InlineKeyboardButton("📊 View Logs", callback_data='view_logs')],
+                [InlineKeyboardButton("❌ Remove Account", callback_data='remove_account')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "🤖 *Telegram Group Joiner Bot*\n\n"
+                "Main Menu - Choose an option:",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
         
         return ConversationHandler.END
     
     async def phone_number_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle phone number input"""
         phone = update.message.text.strip()
-        context.user_data['login_phone'] = phone
         
-        await update.message.reply_text(
-            "📱 *Verification Code*\n\n"
-            "Please enter the verification code you received on Telegram:",
-            parse_mode='Markdown'
-        )
-        return LOGIN_CODE
+        # Basic phone number validation
+        if not phone.startswith('+') or not phone[1:].isdigit():
+            await update.message.reply_text(
+                "❌ *Invalid phone number format*\n\n"
+                "Please use international format with country code.\n"
+                "Example: `+1234567890`\n\n"
+                "Send /cancel to cancel.",
+                parse_mode='Markdown'
+            )
+            return PHONE_NUMBER
+        
+        # Start login process
+        result = await self.account_manager.login_account(phone, update, context)
+        return result
     
     async def code_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle verification code input"""
         code = update.message.text.strip()
-        phone = context.user_data.get('login_phone')
         
-        # Create callbacks for the login process
-        async def get_code():
-            return code
-        
-        async def get_password():
-            # This will be handled in the next state
-            context.user_data['needs_password'] = True
-            return None
-        
-        result = await self.account_manager.login_account(phone, get_code, get_password)
-        
-        if result['success']:
+        # Validate code
+        if not code.isdigit():
             await update.message.reply_text(
-                f"✅ *Login Successful!*\n\n"
-                f"Welcome {result['user']}!\n"
-                f"Phone: {result['phone']}\n\n"
-                f"Use /start to continue.",
+                "❌ *Invalid code*\n\n"
+                "Please enter the numeric code you received.\n"
+                "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
-            context.user_data.clear()
-            return ConversationHandler.END
-        elif "password" in result['error'].lower():
-            await update.message.reply_text(
-                "🔐 *2FA Password Required*\n\n"
-                "This account has two-factor authentication enabled.\n"
-                "Please enter your password:",
-                parse_mode='Markdown'
-            )
-            return LOGIN_PASSWORD
-        else:
-            await update.message.reply_text(
-                f"❌ *Login Failed*\n\nError: {result['error']}\n\n"
-                f"Please try again with /start",
-                parse_mode='Markdown'
-            )
-            context.user_data.clear()
-            return ConversationHandler.END
+            return LOGIN_CODE
+        
+        result = await self.account_manager.verify_code(code, update, context)
+        return result
     
     async def password_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle 2FA password input"""
         password = update.message.text.strip()
-        phone = context.user_data.get('login_phone')
         
-        async def get_code():
-            return None
-        
-        async def get_password():
-            return password
-        
-        result = await self.account_manager.login_account(phone, get_code, get_password)
-        
-        if result['success']:
+        if not password:
             await update.message.reply_text(
-                f"✅ *Login Successful!*\n\n"
-                f"Welcome {result['user']}!\n"
-                f"Phone: {result['phone']}\n\n"
-                f"Use /start to continue.",
+                "❌ *Invalid password*\n\n"
+                "Please enter your 2FA password.\n"
+                "Send /cancel to cancel.",
                 parse_mode='Markdown'
             )
-        else:
-            await update.message.reply_text(
-                f"❌ *Login Failed*\n\nError: {result['error']}\n\n"
-                f"Please try again with /start",
-                parse_mode='Markdown'
-            )
+            return LOGIN_PASSWORD
         
-        context.user_data.clear()
-        return ConversationHandler.END
+        result = await self.account_manager.verify_password(password, update, context)
+        return result
     
     async def handle_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle group links input"""
@@ -493,19 +568,40 @@ class TelegramBot:
         group_links = update.message.text.strip().split('\n')
         group_links = [link.strip() for link in group_links if link.strip()]
         
+        # Validate links
+        valid_links = []
+        for link in group_links:
+            if self.account_manager.extract_invite_hash(link):
+                valid_links.append(link)
+            else:
+                await update.message.reply_text(f"⚠️ Invalid link format (skipped): {link}")
+        
+        if not valid_links:
+            await update.message.reply_text("❌ No valid group links found. Please send valid Telegram invite links.")
+            return WAITING_GROUPS
+        
         selected_accounts = context.user_data.get('selected_accounts', [])
         
         progress_msg = await update.message.reply_text(
-            f"🚀 Starting to join {len(group_links)} groups using {len(selected_accounts)} accounts...\n"
-            f"This may take a while."
+            f"🚀 *Starting join process...*\n\n"
+            f"📊 {len(valid_links)} groups\n"
+            f"👥 {len(selected_accounts)} accounts\n\n"
+            f"⏳ Processing...",
+            parse_mode='Markdown'
         )
         
         all_results = {}
         
-        for phone in selected_accounts:
-            await progress_msg.edit_text(f"Processing account: {phone}\nJoining groups...")
+        for idx, phone in enumerate(selected_accounts):
+            await progress_msg.edit_text(
+                f"🚀 *Joining groups*\n\n"
+                f"📊 Processing account {idx+1}/{len(selected_accounts)}\n"
+                f"👤 Account: `{phone}`\n\n"
+                f"⏳ Please wait...",
+                parse_mode='Markdown'
+            )
             
-            result = await self.account_manager.join_groups_for_account(phone, group_links)
+            result = await self.account_manager.join_groups_for_account(phone, valid_links)
             all_results[phone] = result
         
         # Generate summary
@@ -513,16 +609,20 @@ class TelegramBot:
         for phone, result in all_results.items():
             if result['success']:
                 success_count = sum(1 for r in result['results'] if r['status'] == 'success')
-                summary += f"**{phone}:** {success_count}/{len(group_links)} successful\n"
+                invalid_count = sum(1 for r in result['results'] if r['status'] in ['invalid_link', 'invalid', 'expired'])
+                summary += f"**{phone}:**\n"
+                summary += f"   ✅ Success: {success_count}\n"
+                summary += f"   ❌ Failed: {invalid_count}\n"
+                summary += f"   📊 Total: {len(valid_links)}\n\n"
             else:
-                summary += f"**{phone}:** Failed - {result['error']}\n"
+                summary += f"**{phone}:** ❌ Failed - {result['error']}\n\n"
         
         await progress_msg.edit_text(summary, parse_mode='Markdown')
         
-        # Send detailed report
+        # Send detailed report for each account
         for phone, result in all_results.items():
-            if result['success']:
-                report = f"*Detailed Report for {phone}:*\n\n"
+            if result['success'] and result['results']:
+                report = f"*📋 Detailed Report for {phone}:*\n\n"
                 for r in result['results']:
                     status_icon = {
                         'success': '✅',
@@ -531,10 +631,11 @@ class TelegramBot:
                         'already_member': '👥',
                         'error': '⚠️'
                     }.get(r['status'], '❓')
-                    report += f"{status_icon} {r['link']}\n   {r['message']}\n\n"
+                    report += f"{status_icon} `{r['link']}`\n"
+                    report += f"   {r['message']}\n\n"
                     
                     # Split if too long
-                    if len(report) > 4000:
+                    if len(report) > 3900:
                         await update.message.reply_text(report, parse_mode='Markdown')
                         report = ""
                 
@@ -548,20 +649,27 @@ class TelegramBot:
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel conversation"""
         context.user_data.clear()
-        await update.message.reply_text("Operation cancelled. Use /start to begin again.")
+        await update.message.reply_text(
+            "❌ Operation cancelled.\n\n"
+            "Use /start to begin again."
+        )
         return ConversationHandler.END
 
 # ==================== MAIN ====================
 async def main():
     # Validate configuration
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("\n❌ ERROR: Please set your BOT_TOKEN in the script!")
-        print("Get it from @BotFather on Telegram\n")
+        print("\n" + "="*50)
+        print("❌ ERROR: Please set your BOT_TOKEN!")
+        print("Get it from @BotFather on Telegram")
+        print("="*50 + "\n")
         return
     
     if API_ID == 123456 or API_HASH == "your_api_hash_here":
-        print("\n❌ ERROR: Please set your API_ID and API_HASH in the script!")
-        print("Get them from https://my.telegram.org\n")
+        print("\n" + "="*50)
+        print("❌ ERROR: Please set your API_ID and API_HASH!")
+        print("Get them from https://my.telegram.org")
+        print("="*50 + "\n")
         return
     
     # Initialize bot
@@ -570,24 +678,25 @@ async def main():
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add conversation handler for login
+    # Create conversation handlers
     login_conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(telegram_bot.button_handler, pattern='add_account')],
+        entry_points=[CallbackQueryHandler(telegram_bot.button_handler, pattern='^add_account$')],
         states={
             PHONE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.phone_number_handler)],
             LOGIN_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.code_handler)],
             LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.password_handler)],
         },
-        fallbacks=[CommandHandler("cancel", telegram_bot.cancel)]
+        fallbacks=[CommandHandler("cancel", telegram_bot.cancel)],
+        allow_reentry=True
     )
     
-    # Add conversation handler for groups
     groups_conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(telegram_bot.button_handler, pattern='continue_to_groups')],
+        entry_points=[CallbackQueryHandler(telegram_bot.button_handler, pattern='^continue_to_groups$')],
         states={
             WAITING_GROUPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_bot.handle_groups)],
         },
-        fallbacks=[CommandHandler("cancel", telegram_bot.cancel)]
+        fallbacks=[CommandHandler("cancel", telegram_bot.cancel)],
+        allow_reentry=True
     )
     
     # Add handlers
@@ -597,10 +706,13 @@ async def main():
     application.add_handler(groups_conv_handler)
     
     # Start bot
-    print("\n✅ Bot is starting...")
-    print(f"Bot Token: {BOT_TOKEN[:10]}...")
-    print("Press Ctrl+C to stop\n")
+    print("\n" + "="*50)
+    print("✅ Bot is starting...")
+    print(f"📡 Bot Token: {BOT_TOKEN[:15]}...")
+    print("💡 Press Ctrl+C to stop")
+    print("="*50 + "\n")
     
+    # Start the bot
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
@@ -609,7 +721,9 @@ async def main():
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:
-        print("\n👋 Shutting down...")
+        print("\n" + "="*50)
+        print("👋 Shutting down gracefully...")
+        print("="*50 + "\n")
         await application.stop()
 
 if __name__ == "__main__":
